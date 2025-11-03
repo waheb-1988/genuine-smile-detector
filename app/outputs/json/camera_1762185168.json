@@ -1,0 +1,11 @@
+{
+  "timestamp_utc": "2025-11-03T15:52:49Z",
+  "source": "camera",
+  "image_filename": "camera_1762185168.jpg",
+  "deepface_happy_prob": 0.6594,
+  "eye_aperture": 0.3156,
+  "neutral_eye_baseline": null,
+  "score": 39,
+  "label": "Posed/weak smile likely",
+  "emoji": "🙃🫥"
+}

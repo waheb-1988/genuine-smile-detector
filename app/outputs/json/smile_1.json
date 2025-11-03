@@ -1,0 +1,11 @@
+{
+  "timestamp_utc": "2025-11-03T15:55:52Z",
+  "source": "upload",
+  "image_filename": "smile_1.png",
+  "deepface_happy_prob": 0.9977,
+  "eye_aperture": 0.2717,
+  "neutral_eye_baseline": 0.3393,
+  "score": 70,
+  "label": "Genuine smile likely",
+  "emoji": "😁"
+}

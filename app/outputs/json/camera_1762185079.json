@@ -1,0 +1,11 @@
+{
+  "timestamp_utc": "2025-11-03T15:51:35Z",
+  "source": "camera",
+  "image_filename": "camera_1762185079.jpg",
+  "deepface_happy_prob": 0.9999,
+  "eye_aperture": 0.309,
+  "neutral_eye_baseline": null,
+  "score": 59,
+  "label": "Nice smile, not sure it’s fully Duchenne",
+  "emoji": "😊🙂"
+}

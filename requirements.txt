@@ -1,0 +1,17 @@
+# Use Python 3.10 or 3.11 for best MediaPipe compatibility on Windows
+numpy<2.0
+opencv-python==4.9.0.80
+Pillow>=10.0.0
+streamlit>=1.33.0
+
+# Core inference libs
+deepface==0.0.93
+mediapipe==0.10.14
+
+# API
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+# Models need these (indirect); DeepFace installs many automatically,
+# but keeping it explicit helps reproducibility.
+tensorflow<=2.15.1; platform_system!="Windows"  # optional on CPU-only Windows

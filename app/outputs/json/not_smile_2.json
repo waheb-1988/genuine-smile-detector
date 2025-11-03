@@ -1,0 +1,11 @@
+{
+  "timestamp_utc": "2025-11-03T15:54:53Z",
+  "source": "upload",
+  "image_filename": "not_smile_2.png",
+  "deepface_happy_prob": 0.0087,
+  "eye_aperture": 0.304,
+  "neutral_eye_baseline": 0.3216,
+  "score": 3,
+  "label": "Posed/weak smile likely",
+  "emoji": "🙃🫥"
+}

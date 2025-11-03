@@ -1,0 +1,11 @@
+{
+  "timestamp_utc": "2025-11-03T15:54:02Z",
+  "source": "upload",
+  "image_filename": "smile_2.png",
+  "deepface_happy_prob": 0.9982,
+  "eye_aperture": 0.3154,
+  "neutral_eye_baseline": 0.3216,
+  "score": 60,
+  "label": "Nice smile, not sure it’s fully Duchenne",
+  "emoji": "😊🙂"
+}
