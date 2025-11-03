@@ -1,4 +1,4 @@
-# api.py
+# api/api.py
 import os
 import io
 import json
@@ -11,10 +11,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image
 import numpy as np
-import sys, os
+
+import os, sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from smile.smile import AnalysisResult, AnalyzeResponse
+from smile.core import SmileAnalyzer
+from smile.models import AnalysisResult, AnalyzeResponse
 
 # ------------ Config & folders ------------
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "outputs")

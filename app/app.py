@@ -1,18 +1,15 @@
-# app.py
+# app/app.py
 import os
 import json
-import math
-import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image
 from datetime import datetime
-import sys
+import os, sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-
-
-from smile.smile import AnalysisResult
+from smile.core import SmileAnalyzer
+from smile.models import AnalysisResult
 
 # ---------- Page + CSS ----------
 st.set_page_config(page_title="DeepFace Smile Authenticity", page_icon="😁", layout="centered")
@@ -32,7 +29,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- Output dirs ----------
+# ---------- Config & folders ----------
 OUT_DIR = os.getenv("OUTPUT_DIR", "outputs")
 IMG_DIR = os.path.join(OUT_DIR, "images")
 JSON_DIR = os.path.join(OUT_DIR, "json")
@@ -59,19 +56,34 @@ def save_baseline(samples: list[float]) -> None:
 # ---------- Analyzer ----------
 DETECTOR_BACKEND = os.getenv("DETECTOR_BACKEND", "retinaface")
 analyzer = SmileAnalyzer(output_dir=OUT_DIR, detector_backend=DETECTOR_BACKEND)
-
-# hydrate analyzer baseline from disk
+# hydrate analyzer from disk
 for s in load_baseline():
     analyzer.add_neutral_sample(s)
 
-# ---------- State ----------
-if "detector_backend" not in st.session_state:
-    st.session_state["detector_backend"] = DETECTOR_BACKEND
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.header("Settings")
+    choices = ["retinaface", "opencv", "mtcnn", "ssd"]
+    current = choices.index(analyzer.detector_backend) if analyzer.detector_backend in choices else 0
+    analyzer.detector_backend = st.selectbox("DeepFace detector backend", choices, index=current)
+    st.markdown(
+        f"<div class='small-note'>Baseline file: <code>{BASELINE_PATH}</code><br>"
+        f"Samples: <b>{analyzer.neutral_count()}</b></div>",
+        unsafe_allow_html=True,
+    )
+    if st.button("🗑️ Clear baseline"):
+        analyzer.clear_neutral_samples()
+        save_baseline([])
+        st.info("Baseline cleared.")
 
-def neutral_count() -> int:
-    return analyzer.neutral_count()
+# ---------- Instructions ----------
+st.write("**How to use**")
+st.markdown("""
+1. Capture **2–3 neutral** images (no smile). Baseline auto-saves to disk.  
+2. Then capture your **smile** (camera or upload).  
+3. The app **auto-saves** the original image and a **JSON** with the same base name under `outputs/`.
+""")
 
-# ---------- UI helpers ----------
 def show_big_result(score: int, emoji: str, label: str) -> None:
     st.markdown(
         f'<span class="big-emoji">{emoji}</span>'
@@ -87,7 +99,7 @@ def add_neutral_from_image(pil_img: Image.Image) -> None:
         return
     analyzer.add_neutral_sample(eye_ap)
     save_baseline(analyzer.export_neutral_samples())
-    st.success(f"Neutral baseline sample captured ({neutral_count()} total).")
+    st.success(f"Neutral baseline sample captured ({analyzer.neutral_count()} total).")
 
 def analyze_and_auto_save(pil_img: Image.Image, origin_name: str, source_kind: str) -> None:
     try:
@@ -97,7 +109,7 @@ def analyze_and_auto_save(pil_img: Image.Image, origin_name: str, source_kind: s
     except Exception as e:
         st.error(f"Analysis error: {e}"); return
 
-    # UI
+    # Display
     show_big_result(res.score, res.emoji, res.label)
     with st.expander("Details (JSON preview)"):
         st.json(res.__dict__)
@@ -108,33 +120,6 @@ def analyze_and_auto_save(pil_img: Image.Image, origin_name: str, source_kind: s
     img_path = analyzer.save_image(pil_img, base)
     json_path = analyzer.save_json(res, base)
     st.success(f"Saved!\n\n📷 {img_path}\n📄 {json_path}")
-
-# ---------- Sidebar ----------
-with st.sidebar:
-    st.header("Settings")
-    st.session_state["detector_backend"] = st.selectbox(
-        "DeepFace detector backend",
-        ["retinaface", "opencv", "mtcnn", "ssd"],
-        index=["retinaface", "opencv", "mtcnn", "ssd"].index(st.session_state["detector_backend"])
-    )
-    analyzer.detector_backend = st.session_state["detector_backend"]
-    st.markdown(
-        f"<div class='small-note'>Baseline file: <code>{BASELINE_PATH}</code><br>"
-        f"Samples: <b>{neutral_count()}</b></div>",
-        unsafe_allow_html=True,
-    )
-    if st.button("🗑️ Clear baseline"):
-        analyzer.clear_neutral_samples()
-        save_baseline([])
-        st.info("Baseline cleared.")
-
-# ---------- Instructions ----------
-st.write("**How to use**")
-st.markdown("""
-1. Capture **2–3 neutral** images (no smile). Baseline auto-saves to disk.  
-2. Then capture your **smile** (camera or upload).  
-3. The app **auto-saves** the original image and a **JSON** with the same base name under `outputs/`.
-""")
 
 # ---------- Modes ----------
 mode = st.radio("Choose input mode", ["📷 Camera", "🖼️ Image upload"], horizontal=True)

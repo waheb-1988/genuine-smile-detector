@@ -1,5 +1,5 @@
-# smile.py
-from dataclasses import dataclass, asdict
+# smile/models.py
+from dataclasses import dataclass
 from typing import Optional
 from pydantic import BaseModel
 
