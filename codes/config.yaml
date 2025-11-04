@@ -1,0 +1,20 @@
+# config.yaml
+
+camera:
+  url: "http://172.20.10.2:8080/video"
+  window_width: 960
+  window_height: 540
+
+models:
+  camera_url: "http://172.20.10.2:8080/video"
+  window_size: [960, 540]
+  emotion_model: "Facenet512" #VGG-Face, Facenet, Facenet512, OpenFace, DeepFace, DeepID, ArcFace, Dlib, SFace
+
+weights:
+  happy_weight: 0.6
+  duchenne_weight: 0.4
+
+thresholds:
+  genuine: 85
+  probably_genuine: 70
+  uncertain: 55

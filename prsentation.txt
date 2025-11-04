@@ -1,0 +1,71 @@
+🎯 Slide 1 — Smile Detection Feature: Enhancing Ooredoo App Experience
+
+Title:
+😊 "Smile to Win" — AI-Powered Engagement in the Ooredoo App
+
+Visual:
+📱 Mockup of a phone showing a camera + smile emoji animation (you can insert your Streamlit or prototype image)
+
+Content (3 key sections):
+
+1. Concept
+
+Introduce an AI-powered smile detection tool integrated into the Ooredoo app.
+
+Uses real-time facial analysis (DeepFace + MediaPipe) to detect genuine smiles through the camera.
+
+Friendly and gamified experience — encouraging users to smile to unlock surprises.
+
+2. Technical Component
+
+Built using Python + DeepFace + Streamlit for prototype.
+
+Can be integrated into Ooredoo App SDK as a lightweight module.
+
+Camera access + emotion recognition + reward API trigger.
+
+3. Example Flow
+1️⃣ Open “Smile Challenge” in the Ooredoo app
+2️⃣ Smile at your camera 😁
+3️⃣ AI detects a genuine smile (score ≥ 85/100)
+4️⃣ Receive a reward instantly (e.g., free data or offer)
+
+💡 Slide 2 — Business Impact & Marketing Opportunities
+
+Title:
+🚀 Driving Engagement, Retention, and Brand Positivity
+
+Visual:
+📊 Chart or icon set showing Engagement ↑, Customer Happiness 😊, Data Usage ↑, Brand Buzz 💬
+
+Content:
+
+1. Customer Engagement Boost
+
+Converts passive users into active participants.
+
+Promotes daily app interaction through gamified challenges.
+
+2. Reward Examples
+
+🎁 1 GB free data for 3 genuine smiles in a day.
+
+🎟️ Lucky draw entry for a monthly smartphone prize.
+
+💬 Bonus WhatsApp minutes for completing smile challenges.
+
+🌍 “Smile with Ooredoo” campaign tied to social responsibility (e.g., charity donation per 10k smiles).
+
+3. Business Impact
+
+Increase in daily active users (DAU) and average session time.
+
+Positive brand association → “Ooredoo makes me smile.”
+
+Potential viral marketing on social media (#OoredooSmileChallenge).
+
+4. Future Potential
+
+Extend to store kiosks, retail booths, or CSR events (detect smiles, reward instantly).
+
+Integrate with AI personalization engine for adaptive offers.
