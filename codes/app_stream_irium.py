@@ -7,27 +7,34 @@ import time
 import yaml
 from PIL import ImageFont, ImageDraw, Image
 import inspect
+import os
+from datetime import datetime
 
-# ---------- LOAD CONFIG (simple inline defaults if no YAML) ----------
+# ---------- LOAD CONFIG ----------
 try:
     with open("config.yaml", "r") as f:
         config = yaml.safe_load(f)
 except Exception:
     config = {}
+
 IRIUN_URL = config.get("camera_url", "http://172.20.10.2:8080/video")
 WINDOW_SIZE = tuple(config.get("window_size", [960, 540]))
 EMOTION_MODEL = config.get("emotion_model", "Facenet512")
+SAVE_INTERVAL = 15  # seconds between saved clips
+SAVE_DIR = "saved_clips"
 
 print(f"📸 Using camera stream: {IRIUN_URL}")
 print(f"🧠 Emotion model: {EMOTION_MODEL}")
 print(f"🪟 Window size: {WINDOW_SIZE}")
+
+# ---------- PREPARE OUTPUT DIRECTORY ----------
+os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ---------- FONT (Emoji Support) ----------
 try:
     FONT_PATH = "C:/Windows/Fonts/seguiemj.ttf"  # Windows emoji font
     emoji_font = ImageFont.truetype(FONT_PATH, 36)
 except Exception:
-    # fallback
     emoji_font = ImageFont.truetype("arial.ttf", 36)
 
 # ---------- FACE MESH ----------
@@ -53,36 +60,24 @@ def compute_eye_aperture_ratios(landmarks, w, h):
     right_ap = _dist(r_up, r_low) / right_width
     return (left_ap + right_ap) / 2.0
 
-# ---------- Robust DeepFace analyzer wrapper ----------
+# ---------- DeepFace wrapper ----------
 def _call_deepface_analyze(img_np, actions=["emotion"], enforce_detection=False, model_choice=None):
-    """
-    Try multiple calling patterns for DeepFace.analyze to handle different DeepFace versions:
-      1) analyze(img_path=img_np, actions=..., enforce_detection=..., model_name=...)
-      2) analyze(img_path=img_np, actions=..., enforce_detection=..., model=...)
-      3) analyze(img_np, actions=..., enforce_detection=..., model_name=...)
-      4) analyze(img_np, actions=..., enforce_detection=..., model=...)
-      5) analyze(img_np, actions=..., enforce_detection=...)  (no model arg)
-    Returns the analyze() result or raises the last exception.
-    """
     func = DeepFace.analyze
     sig = inspect.signature(func)
     last_exc = None
 
-    # Build possible kwargs variants depending on signature
     candidates = []
-
-    # prefer named img_path if present
     if 'img_path' in sig.parameters:
         base_kwargs = {'img_path': img_np, 'actions': actions, 'enforce_detection': enforce_detection}
-        if model_choice is not None:
+        if model_choice:
             if 'model_name' in sig.parameters:
                 kw = dict(base_kwargs); kw['model_name'] = model_choice; candidates.append(kw)
             if 'model' in sig.parameters:
                 kw = dict(base_kwargs); kw['model'] = model_choice; candidates.append(kw)
         candidates.append(base_kwargs)
-    # positional numpy array first argument
+
     if True:
-        if model_choice is not None:
+        if model_choice:
             if 'model_name' in sig.parameters:
                 kw = {'actions': actions, 'enforce_detection': enforce_detection, 'model_name': model_choice}
                 candidates.append(('pos', kw))
@@ -91,33 +86,22 @@ def _call_deepface_analyze(img_np, actions=["emotion"], enforce_detection=False,
                 candidates.append(('pos', kw))
         candidates.append(('pos', {'actions': actions, 'enforce_detection': enforce_detection}))
 
-    # Attempt candidates sequentially
     for cand in candidates:
         try:
             if isinstance(cand, tuple) and cand[0] == 'pos':
-                # positional first arg
-                kwargs = cand[1]
-                return func(img_np, **kwargs)
+                return func(img_np, **cand[1])
             else:
                 return func(**cand)
         except TypeError as e:
             last_exc = e
-            # signature mismatch; try next
             continue
         except Exception as e:
-            # other runtime error (model files missing etc.) — surface it
             raise
-
-    # If reached here, nothing worked — raise the last TypeError for debugging
-    raise last_exc if last_exc is not None else RuntimeError("DeepFace.analyze failed without exception")
+    raise last_exc if last_exc else RuntimeError("DeepFace.analyze failed")
 
 def deepface_happy_prob(image_bgr):
-    """
-    Return happiness probability in [0,1] using robust DeepFace call attempts.
-    """
     try:
         res = _call_deepface_analyze(image_bgr, actions=['emotion'], enforce_detection=False, model_choice=EMOTION_MODEL)
-        # normalize result shape
         res_item = res[0] if isinstance(res, list) else res
         emo = res_item.get('emotion') or res_item.get('emotions') or {}
         val = float(emo.get('happy', 0.0))
@@ -147,6 +131,17 @@ if not cap.isOpened():
 else:
     print(f"✅ Connected to camera stream at {IRIUN_URL}")
 
+# Initialize video writer variables
+record_start_time = time.time()
+fourcc = cv2.VideoWriter_fourcc(*'XVID')
+video_writer = None
+
+def start_new_recording():
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filepath = os.path.join(SAVE_DIR, f"smile_{now}.avi")
+    print(f"💾 Starting new recording: {filepath}")
+    return cv2.VideoWriter(filepath, fourcc, 20.0, WINDOW_SIZE)
+
 with mp_face_mesh.FaceMesh(
     static_image_mode=False,
     max_num_faces=1,
@@ -154,7 +149,10 @@ with mp_face_mesh.FaceMesh(
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
 ) as face_mesh:
+
     fps_time = time.time()
+    video_writer = start_new_recording()
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -186,6 +184,16 @@ with mp_face_mesh.FaceMesh(
 
         frame = draw_text_with_emoji(frame, label, (30, 40), color)
 
+        # Write frame to video
+        if video_writer:
+            video_writer.write(frame)
+
+        # Restart recording every SAVE_INTERVAL seconds
+        if time.time() - record_start_time >= SAVE_INTERVAL:
+            video_writer.release()
+            video_writer = start_new_recording()
+            record_start_time = time.time()
+
         fps = 1.0 / (time.time() - fps_time)
         fps_time = time.time()
         cv2.putText(frame, f"FPS: {fps:.1f}", (30, 90),
@@ -195,5 +203,8 @@ with mp_face_mesh.FaceMesh(
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
+# Cleanup
+if video_writer:
+    video_writer.release()
 cap.release()
 cv2.destroyAllWindows()
