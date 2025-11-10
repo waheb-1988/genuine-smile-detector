@@ -1,0 +1,86 @@
+Got it—I can see the error in your second screenshot:
+
+AttributeError: module 'google.cloud.bigquery' has no attribute 'retry'
+
+Why this happens
+
+In your Colab Enterprise environment you’ve got an older google-cloud-bigquery client that doesn’t include the bigquery.retry module. The library code you’re running (inside _job_helpers.py) expects that module to exist (newer client). So it blows up when it tries to access google.cloud.bigquery.retry._DEFAULT_QUERY_JOB_INSERT_RETRY.
+
+You likely have a version mismatch across:
+
+google-cloud-bigquery
+
+google-cloud-bigquery-storage
+
+google-api-core
+
+(or an out-of-date google-cloud-bigquery specifically).
+
+Fix (do once per runtime, then restart kernel)
+
+1) Clean conflicting metapackages (optional but recommended):
+
+!pip uninstall -y google-cloud google
+
+
+2) Install compatible versions:
+
+!pip install -U --force-reinstall \
+  google-cloud-bigquery==3.20.1 \
+  google-cloud-bigquery-storage==2.25.0 \
+  google-api-core>=2.17.1 \
+  pandas-gbq>=0.22.0
+
+
+3) Restart the runtime/kernel (Runtime → Restart runtime).
+This is important so the new packages are actually used.
+
+Minimal, robust BigQuery snippet
+
+This avoids any internal/private retry constants and works across versions:
+
+import pandas as pd
+from google.cloud import bigquery
+from google.api_core.retry import Retry  # public retry class
+
+PROJECT_ID = "ooredoo-oman-ai"
+DATASET_ID = "CX_data"
+TABLE_NAME = "main"
+LOCATION = "me-central1"
+
+client = bigquery.Client(project=PROJECT_ID, location=LOCATION)
+
+query = f"""
+SELECT *
+FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_NAME}`
+LIMIT 100
+"""
+
+# Optional: explicit public Retry config (instead of internal defaults)
+retry = Retry()  # or Retry(deadline=60)
+
+df = client.query(query, retry=retry).to_dataframe()  # storage API not required
+print(f"Loaded {len(df):,} rows from BigQuery")
+df.head()
+
+
+If you want the fastest download for large results, also install google-cloud-bigquery-storage (already included above). The call to_dataframe() will automatically use it if available.
+
+Quick checklist if it still fails
+
+No local folder/file named google/ or google.py in your working directory (would shadow the real package).
+
+Run:
+
+import google, google.cloud.bigquery as bq, pkgutil
+import importlib, sys
+print("bigquery version:", bq.__version__)
+
+
+Ensure it shows 3.20.1 (or the version you pinned).
+
+Make sure you restarted the kernel after installing.
+
+If your environment pre-installs conflicting packages, add the install cell near the top of the notebook so it runs before imports.
+
+If you want, I can also give you a small cell that checks and prints all relevant Google library versions so you can paste it at the top of future notebooks.
