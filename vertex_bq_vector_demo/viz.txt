@@ -1,0 +1,200 @@
+pip install pandas matplotlib wordcloud requests
+1) Paste these helpers after your current code
+python
+Copy code
+# ==== Viz + Word Cloud Agents ================================================
+import io, json, re, requests, pandas as pd, matplotlib.pyplot as plt
+from wordcloud import WordCloud, STOPWORDS
+
+# ---------- Matplotlib Agent ----------
+def matplotlib_agent(
+    df: pd.DataFrame,
+    chart_type: str,
+    x: str = None,
+    y: str = None,
+    agg: str = "sum",
+    title: str = "",
+    top_n: int = None,
+):
+    """
+    Quick inline charting.
+    chart_type: 'bar' | 'line' | 'pie'
+    If x & y specified and y is numeric -> aggregate (sum/mean/count).
+    If only y specified -> simple line over index (for time series already indexed).
+    """
+    if x and y:
+        if agg == "count":
+            data = df.groupby(x)[y].count().sort_values(ascending=False)
+        elif agg == "mean":
+            data = df.groupby(x)[y].mean().sort_values(ascending=False)
+        else:
+            data = df.groupby(x)[y].sum().sort_values(ascending=False)
+    elif y:
+        data = df[y]
+    else:
+        raise ValueError("Provide at least y OR (x and y).")
+
+    if top_n:
+        data = data.head(top_n)
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    if chart_type == "bar":
+        data.plot(kind="bar", ax=ax)
+    elif chart_type == "pie":
+        data.plot(kind="pie", ax=ax, autopct="%1.0f%%")
+        ax.set_ylabel("")
+    else:
+        data.plot(kind="line", ax=ax)
+
+    ax.set_title(title or f"{chart_type.title()} chart")
+    plt.tight_layout()
+    return fig  # display in notebook with `plt.show()`; in Streamlit use st.pyplot(fig)
+
+# ---------- QuickChart Agent (Chart.js → PNG) ----------
+def quickchart_agent(
+    labels,
+    series,
+    title="",
+    chart_type="bar",
+    width=900,
+    height=500,
+    version="4",
+):
+    """
+    Minimal Chart.js config -> POST to QuickChart -> return PNG bytes.
+    labels: list[str]
+    series: list[float] (single-series demo; extend to multiple datasets if you like)
+    """
+    cfg = {
+        "type": chart_type,
+        "data": {
+            "labels": labels,
+            "datasets": [{
+                "label": title or "Series",
+                "data": series,
+            }]
+        },
+        "options": {
+            "plugins": {"legend": {"display": bool(title)}},
+            "responsive": True,
+        },
+    }
+    payload = {"chart": cfg, "width": width, "height": height, "format": "png", "version": version}
+    r = requests.post("https://quickchart.io/chart", json=payload, timeout=30)
+    r.raise_for_status()
+    return r.content, cfg  # bytes, plus the config dict for logging/sharing
+
+# ---------- Word Cloud from a comments column ----------
+def wordcloud_from_comments(
+    df: pd.DataFrame,
+    comments_col: str,
+    extra_stopwords: list[str] = None,
+    max_words: int = 300,
+    background_color: str = "white",
+    width: int = 1200,
+    height: int = 600,
+):
+    """
+    Build a word cloud PNG from a text/comments column.
+    """
+    if comments_col not in df.columns:
+        raise KeyError(f"`{comments_col}` not in DataFrame columns")
+
+    text = " ".join([str(t) for t in df[comments_col].dropna().tolist()])
+
+    # light normalization
+    text = re.sub(r"http\S+|www\S+", " ", text)  # drop URLs
+    text = re.sub(r"[^A-Za-z0-9\s']", " ", text)  # keep alnum and apostrophes
+    text = re.sub(r"\s+", " ", text).strip()
+
+    stops = set(STOPWORDS)
+    if extra_stopwords:
+        stops |= set(w.lower() for w in extra_stopwords)
+
+    wc = WordCloud(
+        width=width,
+        height=height,
+        background_color=background_color,
+        stopwords=stops,
+        max_words=max_words,
+        collocations=True,
+    ).generate(text)
+
+    fig, ax = plt.subplots(figsize=(width/100, height/100))
+    ax.imshow(wc, interpolation="bilinear")
+    ax.axis("off")
+    plt.tight_layout()
+    return fig  # display with plt.show() / st.pyplot(fig)
+# ============================================================================ #
+2) Tiny examples of how to call them
+A) Matplotlib agent (e.g., revenue by region)
+python
+Copy code
+# Sample DF
+df_demo = pd.DataFrame({
+    "region": ["NA","EU","APAC","NA","EU","APAC"],
+    "revenue": [10, 8, 6, 7, 6, 9],
+})
+
+fig = matplotlib_agent(
+    df_demo,
+    chart_type="bar",
+    x="region",
+    y="revenue",
+    agg="sum",
+    title="Revenue by Region",
+)
+plt.show()
+B) QuickChart agent (same data)
+python
+Copy code
+agg = df_demo.groupby("region")["revenue"].sum().sort_values(ascending=False)
+png_bytes, chart_cfg = quickchart_agent(
+    labels=agg.index.tolist(),
+    series=agg.values.tolist(),
+    title="Revenue by Region (QuickChart)",
+    chart_type="bar",
+)
+# Save or display:
+with open("quickchart_bar.png", "wb") as f:
+    f.write(png_bytes)
+print("Chart.js config:", json.dumps(chart_cfg)[:200], "...")
+C) Word cloud from a comments column
+python
+Copy code
+df_comments = pd.DataFrame({
+    "comments": [
+        "Great service, fast response from support",
+        "Pricing could be lower; quality is excellent",
+        "Support response time was slow on weekend",
+        "Excellent translation quality and delivery speed",
+    ]
+})
+
+fig_wc = wordcloud_from_comments(
+    df_comments,
+    comments_col="comments",
+    extra_stopwords=["service","support","translation"],  # optional domain stopwords
+)
+plt.show()
+3) Where this fits in your current RAG file
+Keep your Chroma + Vertex AI code exactly as you have it.
+
+After that block, paste the helpers above.
+
+When you load any tabular data (CSV or a DataFrame you build from hits), call:
+
+matplotlib_agent(...) to render inline, or
+
+build labels, series and call quickchart_agent(...) to get a shareable PNG.
+
+For word cloud, pass your DataFrame and the name of the comments column.
+
+If you want, I can wrap these into a quick Streamlit tab so you can ingest, query, and visualize (including word cloud) in the same app.
+
+
+
+
+
+
+
