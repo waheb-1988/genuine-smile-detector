@@ -1,0 +1,628 @@
+# ================== Imports ==================
+from typing import TypedDict, List, Optional, Any, Dict
+import time
+import pandas as pd
+import chromadb
+import vertexai
+from vertexai.generative_models import GenerativeModel
+from vertexai.language_models import TextEmbeddingModel
+from langgraph.graph import StateGraph, START, END
+import json
+import matplotlib.pyplot as plt
+from wordcloud import WordCloud
+import logging
+from datetime import datetime
+
+# ================== Logging Setup ==================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ================== Vertex AI Configuration ==================
+PROJECT_ID = "ooredoo-oman-ai"
+REGION = "us-central1"
+
+try:
+    vertexai.init(project=PROJECT_ID, location=REGION)
+    llm_model = GenerativeModel("gemini-2.5-pro")
+    embed_model = TextEmbeddingModel.from_pretrained("gemini-embedding-001")
+    logger.info("✅ Vertex AI initialized successfully")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize Vertex AI: {e}")
+    raise
+
+# ================== Chroma DB Setup ==================
+CHROMA_DB_PATH = "./chroma_db"
+client = chromadb.PersistentClient(path=CHROMA_DB_PATH)  # ✅ FIXED: Use persistent storage
+collection = client.get_or_create_collection("survey_collection2")
+logger.info(f"✅ ChromaDB collection ready: {collection.count()} documents")
+
+# ================== State Definition ==================
+class AgentState(TypedDict):
+    question: str
+    embedding: Optional[List[float]]
+    docs: Optional[List[str]]
+    metadatas: Optional[List[dict]]
+    retriever_info: Optional[Dict[str, Any]]
+    df: Optional[pd.DataFrame]
+    refined_query: Optional[str]
+    final_result: Optional[str]
+    final_result_rows: Optional[int]
+    df_result: Optional[pd.DataFrame]
+    timing: Optional[dict]
+    history: Optional[List[Dict[str, str]]]
+    wordcloud_path: Optional[str]  # ✅ NEW: Track wordcloud output
+    chart_path: Optional[str]      # ✅ NEW: Track chart output
+    error: Optional[str]           # ✅ NEW: Track errors
+
+# ================== Agent 1: Retrieve & Embed ==================
+def agent_retrieve_columns(state: AgentState) -> AgentState:
+    """
+    Retrieves documents from ChromaDB using semantic search.
+    Best Practice: Separate concerns - this agent only handles retrieval.
+    """
+    start = time.time()
+    
+    try:
+        # Generate embedding for user question
+        emb = embed_model.get_embeddings([state["question"]])
+        state["embedding"] = emb[0].values
+        
+        # Get all documents for context
+        all_get = collection.get(include=["metadatas", "documents"])
+        metadatas = all_get.get("metadatas", [])
+        docs = all_get.get("documents", [])
+        total_docs = len(metadatas)
+        
+        if total_docs == 0:
+            logger.warning("⚠️ No documents found in collection")
+            state["metadatas"] = []
+            state["docs"] = []
+            state["retriever_info"] = {"total_retrieved": 0, "top_samples": []}
+            state["timing"] = {"retrieve_columns": round(time.time() - start, 2)}
+            return state
+        
+        # Semantic search with all documents
+        results = collection.query(
+            query_embeddings=[state["embedding"]],
+            n_results=total_docs,
+            include=["documents", "metadatas", "distances"]
+        )
+        
+        docs = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+        
+        # Log top 5 matches for debugging
+        top_n = min(5, len(docs))
+        samples = [{
+            "rank": i+1,
+            "distance": round(distances[i], 4) if distances and i < len(distances) else None,
+            "document": docs[i][:100] if i < len(docs) else None,  # Truncate for readability
+            "metadata": {k: v for k, v in metadatas[i].items() if k in ["Survey_Category", "GENDER"]} if i < len(metadatas) else None
+        } for i in range(top_n)]
+        
+        state["docs"] = docs
+        state["metadatas"] = metadatas
+        state["retriever_info"] = {
+            "total_retrieved": len(metadatas),
+            "top_samples": samples
+        }
+        
+        logger.info(f"📊 Retrieved {len(metadatas)} documents")
+        
+    except Exception as e:
+        logger.error(f"❌ Error in retrieval: {e}")
+        state["error"] = f"Retrieval failed: {str(e)}"
+    
+    state["timing"] = {"retrieve_columns": round(time.time() - start, 2)}
+    return state
+
+# ================== Agent 2: Convert to DataFrame ==================
+def agent_metadata_to_df(state: AgentState) -> AgentState:
+    """
+    Converts retrieved metadata to pandas DataFrame.
+    Best Practice: Data type handling and validation.
+    """
+    start = time.time()
+    
+    try:
+        metadatas = state.get("metadatas", [])
+        
+        if metadatas:
+            df = pd.DataFrame(metadatas)
+            
+            # ✅ BEST PRACTICE: Robust data type conversion
+            if "Satisfaction_Level" in df.columns:
+                df["Satisfaction_Level"] = pd.to_numeric(
+                    df["Satisfaction_Level"], 
+                    errors="coerce"
+                )
+            
+            # Handle Survey_Response column properly
+            if "Survey_Response" in df.columns:
+                df["Survey_Response"] = df["Survey_Response"].fillna("")
+            
+            state["df"] = df
+            logger.info(f"📋 DataFrame created: {df.shape[0]} rows, {df.shape[1]} columns")
+        else:
+            state["df"] = pd.DataFrame()
+            logger.warning("⚠️ No metadata to convert to DataFrame")
+            
+    except Exception as e:
+        logger.error(f"❌ Error creating DataFrame: {e}")
+        state["error"] = f"DataFrame creation failed: {str(e)}"
+        state["df"] = pd.DataFrame()
+    
+    state["timing"]["metadata_to_df"] = round(time.time() - start, 2)
+    return state
+
+# ================== Agent 3: Generate Query ==================
+def agent_refine_query(state: AgentState) -> AgentState:
+    """
+    Uses LLM to generate pandas query from natural language.
+    Best Practice: Clear prompting with examples and constraints.
+    """
+    start = time.time()
+    
+    try:
+        df = state.get("df")
+        
+        if df is not None and not df.empty:
+            # ✅ IMPROVED PROMPT: More specific and structured
+            prompt = f"""You are a pandas expert. Generate a SINGLE valid pandas expression.
+
+DataFrame columns: {list(df.columns)}
+Sample data types: {df.dtypes.to_dict()}
+
+User question: "{state['question']}"
+
+Rules:
+1. Return ONLY the pandas expression, no explanations
+2. Use df as the DataFrame variable
+3. For counts/groups use: df.groupby(['col']).size().reset_index(name='count')
+4. For filtering use: df[df['col'] == 'value']
+5. NO markdown, NO ```python, NO comments
+
+Example outputs:
+- df.groupby(['GENDER']).size().reset_index(name='count')
+- df['CUSTOMER_REGION'].value_counts().reset_index(name='count')
+- df[df['Satisfaction_Level'] > 3]
+
+Your pandas expression:"""
+
+            resp = llm_model.generate_content(prompt)
+            
+            # ✅ IMPROVED: Better parsing logic
+            lines = [l.strip() for l in resp.text.splitlines() if l.strip()]
+            expr = None
+            
+            for l in lines:
+                # Clean common formatting issues
+                l = l.replace("```python", "").replace("```", "").strip()
+                
+                # Skip explanatory text
+                if l.lower().startswith(("your pandas", "example", "note:", "the expression")):
+                    continue
+                    
+                # Must start with df or pd
+                if l.startswith(("df", "pd")):
+                    expr = l
+                    break
+            
+            state["refined_query"] = expr
+            logger.info(f"🔍 Generated query: {expr}")
+        else:
+            state["refined_query"] = None
+            logger.warning("⚠️ No DataFrame available for query generation")
+            
+    except Exception as e:
+        logger.error(f"❌ Error generating query: {e}")
+        state["error"] = f"Query generation failed: {str(e)}"
+        state["refined_query"] = None
+    
+    state["timing"]["refine_query"] = round(time.time() - start, 2)
+    return state
+
+# ================== Agent 4: Execute Query ==================
+def agent_apply_query(state: AgentState) -> AgentState:
+    """
+    Executes the generated pandas query safely.
+    Best Practice: Sandboxed execution with error handling.
+    """
+    start = time.time()
+    
+    try:
+        df = state.get("df")
+        expr = state.get("refined_query")
+        
+        if df is not None and expr:
+            # ✅ BEST PRACTICE: Sandboxed execution environment
+            local_env = {"pd": pd, "df": df}
+            
+            result = eval(expr, {"__builtins__": {}}, local_env)
+            
+            # ✅ IMPROVED: Better result type handling
+            if isinstance(result, pd.Series):
+                result_df = result.reset_index()
+                result_df.columns = [result_df.columns[0], 'count'] if len(result_df.columns) == 2 else result_df.columns
+            elif isinstance(result, (int, float, str)):
+                result_df = pd.DataFrame([{"value": result}])
+            elif isinstance(result, pd.DataFrame):
+                result_df = result.reset_index(drop=True)
+            else:
+                result_df = pd.DataFrame(result)
+            
+            state["final_result"] = result_df.to_markdown(index=False)
+            state["final_result_rows"] = len(result_df)
+            state["df_result"] = result_df
+            
+            logger.info(f"✅ Query executed: {len(result_df)} rows returned")
+            
+        else:
+            state["final_result"] = "⚠️ No data or query to execute."
+            state["final_result_rows"] = 0
+            state["df_result"] = pd.DataFrame()
+            
+    except Exception as e:
+        error_msg = f"⚠️ Error executing query: `{expr}`\n{str(e)}"
+        logger.error(error_msg)
+        state["final_result"] = error_msg
+        state["final_result_rows"] = 0
+        state["df_result"] = pd.DataFrame()
+        state["error"] = str(e)
+    
+    state["timing"]["apply_query"] = round(time.time() - start, 2)
+    return state
+
+# ================== Agent 5: Generate Word Cloud ==================
+def agent_generate_wordcloud(state: AgentState) -> AgentState:
+    """
+    ✅ NEW AGENT: Generates word cloud from Survey_Response text.
+    Triggered when user asks about Survey_Response analysis.
+    """
+    start = time.time()
+    
+    try:
+        df = state.get("df")
+        question = state.get("question", "").lower()
+        
+        # ✅ Check if user is asking about Survey_Response
+        survey_keywords = ["survey response", "comment", "feedback", "text", "word cloud", "analyze response"]
+        should_generate = any(keyword in question for keyword in survey_keywords)
+        
+        if df is not None and not df.empty and "Survey_Response" in df.columns and should_generate:
+            # Combine all survey responses
+            text_data = " ".join(df["Survey_Response"].astype(str).tolist())
+            
+            if text_data.strip():
+                # ✅ Generate word cloud with better styling
+                wc = WordCloud(
+                    width=1200,
+                    height=600,
+                    background_color="white",
+                    colormap="viridis",
+                    max_words=100,
+                    relative_scaling=0.5,
+                    min_font_size=10
+                ).generate(text_data)
+                
+                # Save with unique timestamp
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                wc_path = f"survey_wordcloud_{timestamp}.png"
+                
+                plt.figure(figsize=(12, 6))
+                plt.imshow(wc, interpolation="bilinear")
+                plt.axis("off")
+                plt.title("Survey Responses Word Cloud", fontsize=16, fontweight='bold')
+                plt.tight_layout()
+                plt.savefig(wc_path, dpi=300, bbox_inches='tight')
+                plt.close()  # ✅ IMPORTANT: Close to prevent memory leaks
+                
+                state["wordcloud_path"] = wc_path
+                logger.info(f"☁️ Word cloud saved: {wc_path}")
+            else:
+                logger.warning("⚠️ No text data for word cloud")
+        else:
+            logger.info("ℹ️ Word cloud not needed for this query")
+            
+    except Exception as e:
+        logger.error(f"❌ Error generating word cloud: {e}")
+        state["error"] = f"Word cloud generation failed: {str(e)}"
+    
+    state["timing"]["generate_wordcloud"] = round(time.time() - start, 2)
+    return state
+
+# ================== Agent 6: Create Bar Chart ==================
+def agent_visualize_chart(state: AgentState) -> AgentState:
+    """
+    ✅ FIXED: Creates bar chart with unique filename.
+    Only generates if result has 2+ columns.
+    """
+    start = time.time()
+    
+    try:
+        df_result = state.get("df_result")
+        
+        if df_result is not None and not df_result.empty and len(df_result.columns) >= 2:
+            x_col = df_result.columns[0]
+            y_col = df_result.columns[1]
+            
+            # ✅ FIXED: Unique filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            chart_path = f"chart_{timestamp}.png"
+            
+            # ✅ IMPROVED: Better chart styling
+            plt.figure(figsize=(12, 6))
+            plt.bar(df_result[x_col].astype(str), df_result[y_col], color='steelblue', edgecolor='navy')
+            plt.xlabel(x_col, fontsize=12, fontweight='bold')
+            plt.ylabel(y_col, fontsize=12, fontweight='bold')
+            plt.title(f"{y_col} by {x_col}", fontsize=14, fontweight='bold')
+            plt.xticks(rotation=45, ha='right')
+            plt.grid(axis='y', alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(chart_path, dpi=300, bbox_inches='tight')
+            plt.close()  # ✅ IMPORTANT: Close to prevent memory leaks
+            
+            state["chart_path"] = chart_path
+            logger.info(f"📊 Chart saved: {chart_path}")
+        else:
+            logger.info("ℹ️ Chart not generated (insufficient columns or data)")
+            
+    except Exception as e:
+        logger.error(f"❌ Error creating chart: {e}")
+        state["error"] = f"Chart creation failed: {str(e)}"
+    
+    state["timing"]["visualize_chart"] = round(time.time() - start, 2)
+    return state
+
+# ================== Agent 7: Format Final Answer ==================
+def agent_format_answer(state: AgentState) -> AgentState:
+    """
+    Generates summary and suggestions using LLM.
+    Best Practice: Structured JSON output with fallback.
+    """
+    start = time.time()
+    
+    try:
+        if state.get("final_result_rows", 0) > 0 and not state["final_result"].startswith("⚠️"):
+            # ✅ IMPROVED: Better structured prompt
+            prompt = f"""Analyze this query result and provide insights.
+
+User Question: {state['question']}
+
+Result Table:
+{state['final_result']}
+
+Respond with valid JSON only:
+{{
+  "summary": "Brief summary in 15-20 words",
+  "suggestions": [
+    "First follow-up question",
+    "Second follow-up question"
+  ]
+}}
+
+No markdown, no explanations, only JSON."""
+
+            resp = llm_model.generate_content(prompt)
+            
+            try:
+                # ✅ IMPROVED: Clean JSON parsing
+                text = resp.text.strip()
+                text = text.replace("```json", "").replace("```", "").strip()
+                parsed = json.loads(text)
+                summary = parsed.get("summary", "")
+                suggestions = parsed.get("suggestions", [])
+            except Exception as parse_error:
+                logger.warning(f"⚠️ JSON parsing failed: {parse_error}, using fallback")
+                lines = [l.strip() for l in resp.text.splitlines() if l.strip()]
+                summary = lines[0] if lines else "Analysis complete"
+                suggestions = lines[1:3] if len(lines) > 1 else []
+            
+            # Format suggestions
+            sugg_text = "\n".join(f"  • {s}" for s in suggestions[:2])
+            
+            # Add visualizations info
+            viz_info = ""
+            if state.get("chart_path"):
+                viz_info += f"\n📊 Chart saved: {state['chart_path']}"
+            if state.get("wordcloud_path"):
+                viz_info += f"\n☁️ Word cloud saved: {state['wordcloud_path']}"
+            
+            state["final_result"] = (
+                f"{state['final_result']}\n\n"
+                f"{'─' * 60}\n"
+                f"**Summary:** {summary}\n\n"
+                f"**Follow-up Questions:**\n{sugg_text}"
+                f"{viz_info}"
+            )
+        
+        # ✅ BEST PRACTICE: Maintain conversation history
+        if "history" not in state or state["history"] is None:
+            state["history"] = []
+        
+        state["history"].append({
+            "question": state["question"],
+            "answer": state["final_result"],
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ Error formatting answer: {e}")
+        state["error"] = f"Answer formatting failed: {str(e)}"
+    
+    state["timing"]["format_answer"] = round(time.time() - start, 2)
+    return state
+
+# ================== Build LangGraph ==================
+graph = StateGraph(AgentState)
+
+# Add nodes
+graph.add_node("retrieve_columns", agent_retrieve_columns)
+graph.add_node("metadata_to_df", agent_metadata_to_df)
+graph.add_node("refine_query", agent_refine_query)
+graph.add_node("apply_query", agent_apply_query)
+graph.add_node("generate_wordcloud", agent_generate_wordcloud)
+graph.add_node("visualize_chart", agent_visualize_chart)  # ✅ RENAMED
+graph.add_node("format_answer", agent_format_answer)
+
+# Define workflow
+graph.add_edge(START, "retrieve_columns")
+graph.add_edge("retrieve_columns", "metadata_to_df")
+graph.add_edge("metadata_to_df", "refine_query")
+graph.add_edge("refine_query", "apply_query")
+graph.add_edge("apply_query", "generate_wordcloud")
+graph.add_edge("generate_wordcloud", "visualize_chart")
+graph.add_edge("visualize_chart", "format_answer")
+graph.add_edge("format_answer", END)
+
+compiled_graph = graph.compile()
+
+print("\n" + "="*70)
+print("✅ OPTIMIZED AGENTIC RAG SYSTEM READY")
+print("="*70)
+print(f"📊 Collection: {collection.count()} documents")
+print(f"💾 Database: {CHROMA_DB_PATH}")
+print("\nType your questions (or 'exit' to quit, 'workflow' to see diagram)")
+print("="*70 + "\n")
+
+# ================== Interactive Loop ==================
+state: AgentState = {
+    "question": "",
+    "embedding": None,
+    "docs": None,
+    "metadatas": None,
+    "retriever_info": None,
+    "df": None,
+    "refined_query": None,
+    "final_result": None,
+    "final_result_rows": 0,
+    "df_result": None,
+    "timing": {},
+    "history": [],
+    "wordcloud_path": None,
+    "chart_path": None,
+    "error": None
+}
+
+while True:
+    q = input("\n💬 Your question: ").strip()
+    
+    if q.lower() == "exit":
+        print("\n👋 Goodbye! Saving session history...")
+        # ✅ BEST PRACTICE: Save history on exit
+        with open(f"chat_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", "w") as f:
+            json.dump(state["history"], f, indent=2)
+        break
+    
+    if q.lower() == "workflow":
+        print_workflow()
+        continue
+    
+    if not q:
+        continue
+    
+    # Reset paths for new query
+    state["question"] = q
+    state["wordcloud_path"] = None
+    state["chart_path"] = None
+    state["error"] = None
+    
+    # Execute graph
+    final = compiled_graph.invoke(state)
+    
+    # Display results
+    print("\n" + "─"*70)
+    print("📋 RESULT:")
+    print("─"*70)
+    print(final["final_result"])
+    
+    if final.get("error"):
+        print(f"\n⚠️ Error: {final['error']}")
+    
+    print(f"\n⏱️ Timings: {final['timing']}")
+    print("─"*70)
+
+# ================== Workflow Visualization ==================
+def print_workflow():
+    """
+    ✅ NEW: Print ASCII workflow diagram
+    """
+    workflow = """
+    ╔════════════════════════════════════════════════════════════╗
+    ║           AGENTIC RAG WORKFLOW DIAGRAM                     ║
+    ╚════════════════════════════════════════════════════════════╝
+    
+    ┌─────────────┐
+    │   START     │
+    └──────┬──────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │ 1. RETRIEVE COLUMNS      │  ← Semantic search via ChromaDB
+    │    - Embed user question │
+    │    - Query vector DB     │
+    └──────┬───────────────────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │ 2. METADATA TO DF        │  ← Convert to pandas DataFrame
+    │    - Parse metadata      │
+    │    - Type conversion     │
+    └──────┬───────────────────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │ 3. REFINE QUERY          │  ← LLM generates pandas code
+    │    - Analyze question    │
+    │    - Generate expression │
+    └──────┬───────────────────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │ 4. APPLY QUERY           │  ← Execute pandas expression
+    │    - Safe eval()         │
+    │    - Return results      │
+    └──────┬───────────────────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │ 5. GENERATE WORDCLOUD    │  ← If Survey_Response query
+    │    - Check trigger words │
+    │    - Create visualization│
+    └──────┬───────────────────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │ 6. VISUALIZE CHART       │  ← Bar chart for counts
+    │    - Create bar plot     │
+    │    - Save with timestamp │
+    └──────┬───────────────────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │ 7. FORMAT ANSWER         │  ← LLM generates summary
+    │    - Create summary      │
+    │    - Suggest follow-ups  │
+    │    - Update history      │
+    └──────┬───────────────────┘
+           │
+           ▼
+    ┌─────────────┐
+    │     END     │
+    └─────────────┘
+    
+    ╔════════════════════════════════════════════════════════════╗
+    ║  KEY IMPROVEMENTS:                                         ║
+    ║  ✅ Persistent ChromaDB storage                            ║
+    ║  ✅ Unique filenames for visualizations                    ║
+    ║  ✅ Word cloud agent for text analysis                     ║
+    ║  ✅ Comprehensive error handling                           ║
+    ║  ✅ Structured logging                                     ║
+    ║  ✅ Memory-efficient plot closing                          ║
+    ╚════════════════════════════════════════════════════════════╝
+    """
+    print(workflow)
