@@ -1,283 +1,151 @@
-Great idea. Below are two separate, minimal apps—one in Streamlit, one in Gradio—that you can deploy quickly on Cloud Run (recommended for UIs even when the rest of your RAG runs on Vertex AI + GCP). Both apps:
+Option 1: Port Forwarding via Cloud Shell (Simplest)
 
-Call Vertex AI for embeddings and generation (Gemini)
+Start your Streamlit app in the notebook terminal:
 
-Query your ChromaDB server via HTTP (use the IP/DNS of your Chroma service)
+bashstreamlit run your_app.py --server.port 8501
 
-Read config from environment variables so you can reuse the same image across environments
+Set up port forwarding using Cloud Shell:
 
-You’ll get:
+Open Cloud Shell in GCP Console
+Run this command:
 
-App code (two separate files)
 
-requirements.txt
 
-Dockerfile
+bashgcloud compute ssh YOUR_INSTANCE_NAME \
+  --project YOUR_PROJECT_ID \
+  --zone YOUR_ZONE \
+  -- -L 8501:localhost:8501
 
-gcloud commands to build & deploy to Cloud Run
+Click "Web Preview" in Cloud Shell → Preview on port 8501
 
-(Optional) how to run inside Vertex AI Workbench for dev preview via IAP tunnel
+Option 2: Using Vertex AI Workbench's Built-in Proxy
+Vertex AI Workbench instances have a reverse proxy that allows access to specific ports.
 
-0) Environment variables to set
+Start Streamlit with a specific configuration:
 
-Use the same variables for both apps:
+bashstreamlit run your_app.py \
+  --server.port 8501 \
+  --server.address 0.0.0.0 \
+  --server.baseUrlPath /proxy/8501 \
+  --server.enableCORS false \
+  --server.enableXsrfProtection false
+```
 
-# Required
-export PROJECT_ID="your-gcp-project"
-export LOCATION="us-central1"
+2. **Access via the proxy URL:**
+```
+https://YOUR_INSTANCE_ID.notebooks.googleusercontent.com/proxy/8501/
+You can find your instance URL in the Workbench UI - it's the JupyterLab URL but replace /lab with /proxy/8501/
+Option 3: Create a Custom Startup Script (Best for Regular Use)
+Create a script to automatically start Streamlit:
 
-# Chroma HTTP endpoint
-export CHROMA_HOST="chroma-svc-EXTERNAL-IP"   # or private DNS
-export CHROMA_PORT="80"                       # or 8000
+Create start_streamlit.sh:
 
-# (Optional) Gemini model name
-export GENERATIVE_MODEL="gemini-1.5-pro"
-# Text embedding model
-export EMBED_MODEL="text-embedding-004"
+bash#!/bin/bash
+cd /home/jupyter/your_project_directory
+streamlit run your_app.py \
+  --server.port 8501 \
+  --server.address 0.0.0.0 \
+  --server.baseUrlPath /proxy/8501 \
+  --server.enableCORS false \
+  --server.enableXsrfProtection false \
+  --server.headless true
 
-1) Streamlit app
-a) streamlit_app.py
+Make it executable and run:
+
+bashchmod +x start_streamlit.sh
+nohup ./start_streamlit.sh > streamlit.log 2>&1 &
+```
+
+3. **Access at:**
+```
+https://YOUR_INSTANCE_ID.notebooks.googleusercontent.com/proxy/8501/
+Option 4: Using Cloud Run (Production Deployment)
+For production or sharing with others:
+
+Create a Dockerfile:
+
+dockerfileFROM python:3.9-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY . .
+
+EXPOSE 8080
+
+CMD streamlit run your_app.py \
+    --server.port 8080 \
+    --server.address 0.0.0.0 \
+    --server.headless true
+
+Deploy to Cloud Run:
+
+bashgcloud run deploy streamlit-app \
+  --source . \
+  --region us-central1 \
+  --allow-unauthenticated
+Quick Troubleshooting
+If you can't access Streamlit:
+
+Check if Streamlit is running:
+
+bashps aux | grep streamlit
+netstat -tulpn | grep 8501
+
+Check firewall rules:
+
+bash# In your notebook
+curl http://localhost:8501
+
+View Streamlit logs:
+
+bashtail -f streamlit.log
+# or
+streamlit run your_app.py --server.port 8501 --logger.level=debug
+
+Get your exact proxy URL:
+
+python# Run in a notebook cell
 import os
+import socket
+
+hostname = socket.gethostname()
+print(f"Access Streamlit at:")
+print(f"https://{hostname}.notebooks.googleusercontent.com/proxy/8501/")
+Example Complete Workflow
+Here's a complete example to get you started:
+bash# 1. Install Streamlit (if not already installed)
+pip install streamlit
+
+# 2. Create a simple test app
+cat > test_app.py << 'EOF'
 import streamlit as st
-import chromadb
-from chromadb.config import Settings
-from google.cloud import aiplatform
-from vertexai.generative_models import GenerativeModel, Part
 
-PROJECT_ID = os.environ.get("PROJECT_ID")
-LOCATION = os.environ.get("LOCATION", "us-central1")
-CHROMA_HOST = os.environ.get("CHROMA_HOST", "localhost")
-CHROMA_PORT = int(os.environ.get("CHROMA_PORT", "8000"))
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-004")
-GEN_MODEL = os.environ.get("GENERATIVE_MODEL", "gemini-1.5-pro")
+st.title("Vertex AI Streamlit Test")
+st.write("Hello from Vertex AI Workbench!")
 
-# Vertex init
-aiplatform.init(project=PROJECT_ID, location=LOCATION)
-embed_model = aiplatform.TextEmbeddingModel.from_pretrained(EMBED_MODEL)
-gen = GenerativeModel(GEN_MODEL)
+if st.button("Click me"):
+    st.success("It works!")
+EOF
 
-# Chroma client (HTTP)
-client = chromadb.HttpClient(
-    host=CHROMA_HOST,
-    port=CHROMA_PORT,
-    settings=Settings(allow_reset=False),
-)
-collection = client.get_or_create_collection(name="docs", metadata={"hnsw:space": "cosine"})
+# 3. Start Streamlit
+streamlit run test_app.py \
+  --server.port 8501 \
+  --server.address 0.0.0.0 \
+  --server.baseUrlPath /proxy/8501 \
+  --server.enableCORS false \
+  --server.enableXsrfProtection false &
 
-def embed_texts(texts):
-    # returns list[list[float]]
-    res = embed_model.get_embeddings(texts)
-    return [e.values for e in res]
-
-st.set_page_config(page_title="RAG Demo (Streamlit)", page_icon="🧩", layout="centered")
-st.title("🧩 RAG Demo – Streamlit + Vertex AI + Chroma")
-
-with st.sidebar:
-    st.header("Config")
-    st.write(f"Project: `{PROJECT_ID}`")
-    st.write(f"Location: `{LOCATION}`")
-    st.write(f"Chroma: `{CHROMA_HOST}:{CHROMA_PORT}`")
-    top_k = st.slider("Top-K", 1, 10, 4)
-
-tab_query, tab_ingest = st.tabs(["🔎 Query", "⬆️ Ingest"])
-
-with tab_ingest:
-    st.subheader("Add a document")
-    doc_id = st.text_input("Doc ID", value="doc1")
-    doc_text = st.text_area("Text", height=160, value="Chroma is a vector DB. Vertex AI provides embeddings and LLMs.")
-    if st.button("Upsert"):
-        emb = embed_texts([doc_text])
-        collection.upsert(ids=[doc_id], documents=[doc_text], embeddings=emb)
-        st.success(f"Upserted `{doc_id}`")
-
-with tab_query:
-    st.subheader("Ask a question")
-    q = st.text_input("Your question", value="How do I store embeddings in GCP?")
-    if st.button("Search & Answer"):
-        q_emb = embed_texts([q])[0]
-        result = collection.query(query_embeddings=[q_emb], n_results=top_k)
-        docs = result.get("documents", [[]])[0] if result else []
-        ctx = "\n\n".join(docs) if docs else "No context."
-
-        prompt = f"Answer using only the context.\n\nContext:\n{ctx}\n\nQuestion: {q}"
-        answer = gen.generate_content([Part.from_text(prompt)]).text
-        st.markdown("### Context")
-        st.write(ctx)
-        st.markdown("### Answer")
-        st.write(answer)
-
-b) requirements.txt
-streamlit==1.37.0
-chromadb==0.5.5
-google-cloud-aiplatform>=1.66.0
-grpcio>=1.62.0
-protobuf>=4.25.3
-
-c) Dockerfile
-FROM python:3.11-slim
-
-# System deps
-RUN apt-get update && apt-get install -y build-essential && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY streamlit_app.py /app/
-
-# Streamlit config: listen on 0.0.0.0
-ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
-ENV STREAMLIT_SERVER_PORT=8080
-ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
-
-EXPOSE 8080
-CMD ["streamlit", "run", "streamlit_app.py"]
-
-d) Build & deploy to Cloud Run
-# Build
-gcloud builds submit --tag gcr.io/$PROJECT_ID/streamlit-rag:latest
-
-# Deploy
-gcloud run deploy streamlit-rag \
-  --image gcr.io/$PROJECT_ID/streamlit-rag:latest \
-  --platform managed \
-  --region $LOCATION \
-  --allow-unauthenticated \
-  --set-env-vars PROJECT_ID=$PROJECT_ID,LOCATION=$LOCATION,CHROMA_HOST=$CHROMA_HOST,CHROMA_PORT=$CHROMA_PORT,EMBED_MODEL=$EMBED_MODEL,GENERATIVE_MODEL=$GEN_MODEL
-
-2) Gradio app
-a) gradio_app.py
-import os
-import gradio as gr
-import chromadb
-from chromadb.config import Settings
-from google.cloud import aiplatform
-from vertexai.generative_models import GenerativeModel, Part
-
-PROJECT_ID = os.environ.get("PROJECT_ID")
-LOCATION = os.environ.get("LOCATION", "us-central1")
-CHROMA_HOST = os.environ.get("CHROMA_HOST", "localhost")
-CHROMA_PORT = int(os.environ.get("CHROMA_PORT", "8000"))
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-004")
-GEN_MODEL = os.environ.get("GENERATIVE_MODEL", "gemini-1.5-pro")
-
-# Vertex init
-aiplatform.init(project=PROJECT_ID, location=LOCATION)
-embed_model = aiplatform.TextEmbeddingModel.from_pretrained(EMBED_MODEL)
-gen = GenerativeModel(GEN_MODEL)
-
-# Chroma client
-client = chromadb.HttpClient(
-    host=CHROMA_HOST,
-    port=CHROMA_PORT,
-    settings=Settings(allow_reset=False),
-)
-collection = client.get_or_create_collection(name="docs", metadata={"hnsw:space": "cosine"})
-
-def embed_texts(texts):
-    res = embed_model.get_embeddings(texts)
-    return [e.values for e in res]
-
-def upsert(doc_id, text):
-    if not doc_id or not text:
-        return "Provide doc id and text."
-    emb = embed_texts([text])
-    collection.upsert(ids=[doc_id], documents=[text], embeddings=emb)
-    return f"Upserted {doc_id}"
-
-def ask(question, top_k):
-    if not question:
-        return "Ask something…", ""
-    q_emb = embed_texts([question])[0]
-    res = collection.query(query_embeddings=[q_emb], n_results=int(top_k))
-    docs = res.get("documents", [[]])[0] if res else []
-    ctx = "\n\n".join(docs) if docs else "No context."
-    prompt = f"Answer using only the context.\n\nContext:\n{ctx}\n\nQuestion: {question}"
-    answer = gen.generate_content([Part.from_text(prompt)]).text
-    return answer, ctx
-
-with gr.Blocks(title="RAG Demo – Gradio") as app:
-    gr.Markdown("# 🧩 RAG Demo – Gradio + Vertex AI + Chroma")
-    with gr.Row():
-        with gr.Column():
-            gr.Markdown("### Ingest")
-            doc_id = gr.Textbox(label="Doc ID", value="doc1")
-            doc_text = gr.Textbox(label="Text", lines=6, value="Chroma is a vector DB. Vertex AI provides embeddings and LLMs.")
-            btn_u = gr.Button("Upsert")
-            out_u = gr.Markdown()
-        with gr.Column():
-            gr.Markdown("### Query")
-            q = gr.Textbox(label="Question", value="How do I store embeddings in GCP?")
-            topk = gr.Slider(1, 10, step=1, value=4, label="Top-K")
-            btn_q = gr.Button("Search & Answer")
-            ans = gr.Markdown()
-            ctx = gr.Markdown()
-
-    btn_u.click(fn=upsert, inputs=[doc_id, doc_text], outputs=[out_u])
-    btn_q.click(fn=ask, inputs=[q, topk], outputs=[ans, ctx])
-
-app.queue()
-
-if __name__ == "__main__":
-    # Bind to 0.0.0.0 for Cloud Run
-    app.launch(server_name="0.0.0.0", server_port=8080)
-
-b) requirements.txt
-gradio==4.44.0
-chromadb==0.5.5
-google-cloud-aiplatform>=1.66.0
-grpcio>=1.62.0
-protobuf>=4.25.3
-
-c) Dockerfile
-FROM python:3.11-slim
-
-RUN apt-get update && apt-get install -y build-essential && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY gradio_app.py /app/
-EXPOSE 8080
-CMD ["python", "gradio_app.py"]
-
-d) Build & deploy to Cloud Run
-gcloud builds submit --tag gcr.io/$PROJECT_ID/gradio-rag:latest
-
-gcloud run deploy gradio-rag \
-  --image gcr.io/$PROJECT_ID/gradio-rag:latest \
-  --platform managed \
-  --region $LOCATION \
-  --allow-unauthenticated \
-  --set-env-vars PROJECT_ID=$PROJECT_ID,LOCATION=$LOCATION,CHROMA_HOST=$CHROMA_HOST,CHROMA_PORT=$CHROMA_PORT,EMBED_MODEL=$EMBED_MODEL,GENERATIVE_MODEL=$GEN_MODEL
-
-3) Using Vertex AI Workbench for quick dev-only previews
-
-You can run either app inside a Workbench notebook VM and port-forward through IAP (no public exposure):
-
-# On your local terminal (notebook must be running)
-gcloud compute start-iap-tunnel <workbench-vm-name> 8080 --local-host-port=localhost:8080 --zone=<zone>
-
-# On the notebook VM terminal:
-pip install -r requirements.txt
-# Streamlit
-STREAMLIT_SERVER_PORT=8080 streamlit run streamlit_app.py
-# OR Gradio
-python gradio_app.py
-
-
-Then open http://localhost:8080
- on your local machine.
-
-4) Tips
-
-Put your Streamlit/Gradio service and Chroma in the same region/VPC to avoid egress and reduce latency.
-
-For private access, deploy Cloud Run privately (VPC connector, no-unauth) and front it with IAP or Cloud Endpoints; set an auth header in the app if needed.
-
-Add basic observability: Cloud Run provides request logs + metrics; you can add Prometheus exporters if you move to GKE.
-
-If you need large-scale vector search, keep Chroma for prototyping and plan a path to Vertex AI Vector Search later.
-
-If you tell me your project/region and whether you want public or private endpoints, I can generate the exact gcloud commands with networking/IAM (IAP, service accounts, VPC connectors) tailored to your setup for each app.
+# 4. Get your URL
+python3 << 'EOF'
+import socket
+hostname = socket.gethostname()
+print(f"\n🎈 Access your Streamlit app at:")
+print(f"https://{hostname}.notebooks.googleusercontent.com/proxy/8501/\n")
+EOF
+Recommended Approach
+For development in Vertex AI Workbench: Use Option 2 (built-in proxy)
+For production or sharing: Use Option 4 (Cloud Run)
+Which option would you like to implement? I can provide more specific guidance based on your setup.
