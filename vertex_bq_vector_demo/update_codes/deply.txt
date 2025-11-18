@@ -1,0 +1,872 @@
+Thought for 53sHere’s a clean GitHub-style project structure that:
+
+
+Separates backend (FastAPI + your agent/graph) and frontend (Gradio)
+
+
+Keeps your Vertex AI + BigQuery + LangGraph agent code in the backend
+
+
+Uses no .env files (all config in Python / YAML)
+
+
+Includes: .gitignore, requirements.txt, example service.yaml, README.md
+
+
+You can copy–paste these into your Vertex AI Workbench repo.
+
+1. Repository Structure
+surveyiq-agent/
+├── backend/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── main.py                # FastAPI entrypoint
+│   │   ├── api/
+│   │   │   ├── __init__.py
+│   │   │   └── v1/
+│   │   │       ├── __init__.py
+│   │   │       └── routes_chat.py # /api/v1/chat endpoint
+│   │   ├── core/
+│   │   │   ├── __init__.py
+│   │   │   ├── config.py          # PROJECT_ID, REGION, BQ config
+│   │   │   └── logging_config.py  # logging setup
+│   │   └── services/
+│   │       ├── __init__.py
+│   │       └── agent.py           # your Vertex AI + BigQuery + LangGraph agent
+│   ├── requirements.txt
+│   ├── Dockerfile                 # optional, for Cloud Run
+│   └── service.yaml               # example Cloud Run YAML
+│
+├── frontend/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   └── main.py                # Gradio UI calling FastAPI backend
+│   └── requirements.txt
+│
+├── .gitignore
+├── README.md
+└── pyproject.toml                 # optional, for tooling/formatters
+
+
+2. Backend Files
+backend/app/core/config.py
+# backend/app/core/config.py
+from typing import Final
+
+# ---- Vertex AI / BigQuery configuration (NO .env used) ----
+PROJECT_ID: Final[str] = "ooredoo-oman-ai"
+REGION: Final[str] = "us-central1"
+
+VECTOR_DB: Final[str] = "bigquery"
+BQ_DATASET: Final[str] = "cx_data"
+BQ_TABLE: Final[str] = "survey_embeddings"
+
+# Retrieval / result limits
+TOP_K: Final[int] = 100000        # retrieve all possible rows from BQ
+MAX_ROWS_FOR_LLM: Final[int] = 50
+MAX_ROWS_IN_TABLE: Final[int] = 60
+
+
+backend/app/core/logging_config.py
+# backend/app/core/logging_config.py
+import logging
+
+def setup_logging(level: int = logging.INFO) -> logging.Logger:
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+    logger = logging.getLogger("surveyiq-backend")
+    logger.info("✅ Logging initialized")
+    return logger
+
+
+backend/app/services/agent.py
+This is basically your agent code, refactored slightly into a module and exposing a run_agent function used by the FastAPI route.
+# backend/app/services/agent.py
+from typing import TypedDict, List, Optional, Any, Dict
+import time
+import pandas as pd
+import vertexai
+from vertexai.generative_models import GenerativeModel
+from vertexai.language_models import TextEmbeddingModel
+from langgraph.graph import StateGraph
+import json
+import logging
+from datetime import datetime
+from google.cloud import bigquery
+import numpy as np
+
+from app.core.config import (
+    VECTOR_DB,
+    PROJECT_ID,
+    REGION,
+    BQ_DATASET,
+    BQ_TABLE,
+    TOP_K,
+    MAX_ROWS_FOR_LLM,
+    MAX_ROWS_IN_TABLE,
+)
+
+logger = logging.getLogger("surveyiq-backend.agent")
+
+# ================== Vertex AI / BigQuery Init ==================
+vertexai.init(project=PROJECT_ID, location=REGION)
+llm_model = GenerativeModel("gemini-2.5-pro")
+embed_model = TextEmbeddingModel.from_pretrained("text-embedding-005")
+bq_client = bigquery.Client(project=PROJECT_ID)
+
+logger.info(f"🔧 Configuration: Using {VECTOR_DB.upper()} as vector database")
+
+# ================== State Definition ==================
+class AgentState(TypedDict, total=False):
+    question: str
+    embedding: Optional[List[float]]
+    docs: Optional[List[str]]
+    metadatas: Optional[List[dict]]
+    retriever_info: Optional[Dict[str, Any]]
+    df: Optional[pd.DataFrame]
+    refined_query: Optional[str]
+    final_result: Optional[str]
+    final_result_rows: Optional[int]
+    df_result: Optional[pd.DataFrame]
+    timing: Optional[dict]
+    history: Optional[List[Dict[str, Any]]]
+    vector_db_used: Optional[str]
+    text_column_name: Optional[str]
+    is_text_analysis: Optional[bool]
+    error: Optional[str]
+
+# ================== Helper: Markdown table ==================
+def df_to_markdown_table(df: pd.DataFrame, max_rows: int = MAX_ROWS_IN_TABLE) -> str:
+    if df is None or df.empty:
+        return "_No rows returned._"
+
+    display_df = df.copy()
+    truncated = False
+    if len(display_df) > max_rows:
+        display_df = display_df.head(max_rows)
+        truncated = True
+
+    if display_df.index.name or not isinstance(display_df.index, pd.RangeIndex):
+        display_df = display_df.reset_index()
+
+    try:
+        table_md = display_df.to_markdown(index=False)
+    except Exception:
+        text = display_df.to_string(index=False)
+        table_md = f"```text\n{text}\n```"
+
+    if truncated:
+        table_md += f"\n\n_Only showing first {max_rows} of {len(df)} rows._"
+
+    return table_md
+
+# ================== Agent 1: Retrieve & Convert to DF ==================
+def agent_retrieve_and_df(state: AgentState) -> AgentState:
+    start = time.time()
+    state["vector_db_used"] = VECTOR_DB
+
+    try:
+        emb = embed_model.get_embeddings([state["question"]])
+        state["embedding"] = emb[0].values
+        embedding_str = "[" + ",".join(map(str, state["embedding"])) + "]"
+
+        search_query = f"""
+        SELECT base.*, distance FROM VECTOR_SEARCH(
+            TABLE `{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}`,
+            'embedding',
+            (SELECT {embedding_str} AS embedding),
+            distance_type => 'COSINE',
+            top_k => {TOP_K}
+        )
+        """
+
+        logger.info(f"🔍 Running BigQuery VECTOR_SEARCH with top_k={TOP_K}")
+        results_df = bq_client.query(search_query).to_dataframe()
+
+        if results_df.empty:
+            state["df"] = pd.DataFrame()
+            state["docs"] = []
+            state["metadatas"] = []
+            state["retriever_info"] = {"total_retrieved": 0, "top_samples": []}
+            state["text_column_name"] = None
+        else:
+            metadatas = results_df.drop(
+                columns=["embedding", "distance"],
+                errors="ignore"
+            ).to_dict("records")
+
+            df = pd.DataFrame(metadatas)
+
+            text_cols = [
+                c for c in df.columns
+                if c.lower() in ["survey_response", "response", "comment", "feedback", "text"]
+            ]
+            text_column_name = text_cols[0] if text_cols else None
+
+            if text_column_name:
+                df[text_column_name] = df[text_column_name].fillna("")
+
+            if "Satisfaction_Level" in df.columns:
+                df["Satisfaction_Level"] = pd.to_numeric(df["Satisfaction_Level"], errors="coerce")
+
+            state["df"] = df
+            state["metadatas"] = metadatas
+            state["retriever_info"] = {
+                "total_retrieved": len(df),
+                "top_samples": df.head(5).to_dict("records"),
+                "database": VECTOR_DB,
+            }
+            state["text_column_name"] = text_column_name
+
+            sample_df_for_docs = df.head(200)
+            state["docs"] = sample_df_for_docs.astype(str).apply(
+                lambda x: " | ".join(x),
+                axis=1
+            ).tolist()
+
+        logger.info(f"✅ Retrieval + DataFrame conversion done: {len(state.get('df', []))} rows")
+
+    except Exception as e:
+        logger.error(f"❌ Retrieval & DF conversion failed: {e}")
+        state["error"] = str(e)
+        state["df"] = pd.DataFrame()
+        state["text_column_name"] = None
+
+    state["timing"] = state.get("timing", {})
+    state["timing"]["retrieve_and_df"] = round(time.time() - start, 2)
+    return state
+
+# ================== Agent 2: Refine Query ==================
+def agent_refine_query(state: AgentState) -> AgentState:
+    start = time.time()
+    try:
+        df = state.get("df")
+        text_column_name = state.get("text_column_name")
+
+        if df is not None and not df.empty:
+            sample_data = df.head(3).to_dict("records")
+            question_lower = state["question"].lower()
+
+            text_keywords = [
+                "survey response", "survey_response", "comment", "feedback", "text", "what did",
+                "customer say", "responses say", "customer feedback", "customer comment", "response"
+            ]
+            is_text_query = any(keyword in question_lower for keyword in text_keywords)
+            if is_text_query and text_column_name:
+                state["is_text_analysis"] = True
+                logger.info(f"🎯 Detected text analysis intent - using column: {text_column_name}")
+            else:
+                state["is_text_analysis"] = False
+
+            prompt = f"""You are a pandas expert. Generate a SINGLE valid pandas expression to answer the user's question.
+
+DataFrame info:
+- Columns: {list(df.columns)}
+- Data types: {df.dtypes.to_dict()}
+- Shape: {df.shape[0]} rows × {df.shape[1]} columns
+- Sample rows: {sample_data}
+- Text column (if available): {text_column_name}
+- Vector Database: {state.get('vector_db_used', 'unknown')}
+
+User question: "{state['question']}"
+
+CRITICAL RULES:
+1. Return ONLY a pandas expression starting with 'df'
+2. NO explanations, NO markdown, NO python, NO backticks
+3. The expression must be executable as-is
+4. Use EXACT column names from the columns list above
+5. For counting total rows use: len(df)
+6. For counting by groups use: df.groupby(['col']).size().reset_index(name='count')
+7. For text columns: df[['{text_column_name}']]
+
+Now generate ONLY the pandas expression:"""
+
+            resp = llm_model.generate_content(prompt)
+
+            raw_text = (resp.text or "").strip()
+            cleaned = raw_text.replace("```python", "").replace("```", "").strip()
+            lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
+            expr = None
+
+            for l in lines:
+                if any(skip in l.lower() for skip in ["your pandas", "example", "note:", "the expression", "answer:", "a:"]):
+                    continue
+                if l.startswith(("df", "pd", "len(")):
+                    expr = l
+                    break
+
+            if not expr:
+                for l in lines:
+                    if "df" in l and not l.lower().startswith(("q:", "user", "question")):
+                        expr = l
+                        break
+
+            if not expr:
+                if is_text_query and text_column_name:
+                    expr = f"df[['{text_column_name}']]"
+                    logger.info(f"📝 Applied fallback: {text_column_name} text query")
+                elif any(word in question_lower for word in ["total", "how many", "count all", "number of"]):
+                    expr = "len(df)"
+                    logger.info("📝 Applied fallback: total count query")
+                elif "by" in question_lower or "per" in question_lower:
+                    for col in df.columns:
+                        if col.lower().replace("_", " ") in question_lower:
+                            expr = f"df.groupby(['{col}']).size().reset_index(name='count')"
+                            logger.info(f"📝 Applied fallback: group by {col}")
+                            break
+
+            if expr and not (expr.startswith(("df", "pd", "len(df)")) or "df" in expr):
+                logger.warning(f"⚠️ Invalid expression detected: {expr}")
+                expr = None
+
+            state["refined_query"] = expr
+
+            if expr:
+                logger.info(f"🔍 Generated query: {expr}")
+            else:
+                logger.warning(f"⚠️ Failed to generate query for: {state['question']}")
+
+        else:
+            state["refined_query"] = None
+            logger.warning("⚠️ No DataFrame available for query generation")
+
+    except Exception as e:
+        logger.error(f"❌ Error generating query: {e}")
+        state["error"] = f"Query generation failed: {str(e)}"
+        state["refined_query"] = None
+
+    state["timing"] = state.get("timing", {})
+    state["timing"]["refine_query"] = round(time.time() - start, 2)
+    return state
+
+# ================== Agent 3: Apply Query ==================
+def agent_apply_query(state: AgentState) -> AgentState:
+    start = time.time()
+    df = state.get("df")
+    expr = state.get("refined_query")
+
+    SAFE_BUILTINS = {
+        "list": list,
+        "len": len,
+        "sum": sum,
+        "max": max,
+        "min": min,
+        "round": round,
+    }
+
+    try:
+        if df is None or df.empty:
+            state["final_result"] = "📭 No data found for your query."
+            state["final_result_rows"] = 0
+            state["df_result"] = pd.DataFrame()
+        elif not expr:
+            state["final_result"] = "⚠️ No query generated. Please rephrase your question."
+            state["final_result_rows"] = 0
+            state["df_result"] = pd.DataFrame()
+        else:
+            result = eval(
+                expr,
+                {"__builtins__": SAFE_BUILTINS},
+                {"df": df, "pd": pd, "np": np}
+            )
+
+            if isinstance(result, pd.DataFrame):
+                state["df_result"] = result
+                state["final_result_rows"] = len(result)
+                if result.empty:
+                    state["final_result"] = "📭 No data found for your query."
+                else:
+                    state["final_result"] = f"✅ Query applied successfully. Rows returned: {state['final_result_rows']}"
+            elif isinstance(result, pd.Series):
+                state["df_result"] = result.to_frame()
+                state["final_result_rows"] = len(state["df_result"])
+                if state["df_result"].empty:
+                    state["final_result"] = "📭 No data found for your query."
+                else:
+                    state["final_result"] = f"✅ Query applied successfully. Rows returned: {state['final_result_rows']}"
+            else:
+                state["df_result"] = pd.DataFrame({"result": [result]})
+                state["final_result_rows"] = 1
+                state["final_result"] = f"✅ Query applied successfully. Result: {result}"
+
+    except Exception as e:
+        logger.error(f"❌ Query execution failed: {e}")
+        state["error"] = str(e)
+        state["final_result"] = (
+            "⚠️ Query execution failed. "
+            "Please try rephrasing your question or check column names."
+        )
+        state["final_result_rows"] = 0
+        state["df_result"] = pd.DataFrame()
+
+    state["timing"] = state.get("timing", {})
+    state["timing"]["apply_query"] = round(time.time() - start, 2)
+    return state
+
+# ================== Agent 4: Format Answer ==================
+def agent_format_answer(state: AgentState) -> AgentState:
+    start = time.time()
+
+    try:
+        df_result = state.get("df_result", pd.DataFrame())
+        base_answer_parts: List[str] = []
+
+        if df_result is not None and not df_result.empty and not str(state.get("final_result", "")).startswith("⚠️"):
+            table_md = df_to_markdown_table(df_result)
+            base_answer_parts.append("### 📊 Query Result\n\n" + table_md)
+        else:
+            if state.get("final_result"):
+                base_answer_parts.append(str(state["final_result"]))
+            else:
+                base_answer_parts.append("⚠️ No result to display.")
+
+        if df_result is not None and not df_result.empty and not str(state.get("final_result", "")).startswith("⚠️"):
+            sample_df = df_result.head(MAX_ROWS_FOR_LLM)
+            sample_csv = sample_df.to_csv(index=False)
+
+            prompt = f"""Analyze this query result and provide insights.
+
+User Question: {state['question']}
+Vector Database: {state.get('vector_db_used', 'unknown')}
+
+Result sample as CSV:
+{sample_csv}
+
+Respond with valid JSON only:
+{{
+  "summary": "Brief summary in 15-20 words",
+  "suggestions": [
+    "First follow-up question",
+    "Second follow-up question"
+  ]
+}}
+
+No markdown, no explanations, only JSON.
+"""
+
+            try:
+                resp = llm_model.generate_content(
+                    prompt,
+                    generation_config={"max_output_tokens": 256, "temperature": 0.25}
+                )
+                text = (resp.text or "").strip()
+                text = text.replace("```json", "").replace("```", "").strip()
+
+                parsed = json.loads(text)
+                summary = parsed.get("summary", "")
+                suggestions = parsed.get("suggestions", [])
+            except Exception as parse_error:
+                logger.warning(f"⚠️ JSON parsing failed in format_answer: {parse_error}, using fallback")
+                raw = (resp.text or "") if "resp" in locals() else ""
+                lines = [l.strip() for l in raw.splitlines() if l.strip()]
+                summary = lines[0] if lines else "Analysis complete."
+                suggestions = lines[1:3] if len(lines) > 1 else []
+
+            sugg_text = "\n".join(f"- {s}" for s in suggestions[:2])
+            db_info = state.get("vector_db_used", "unknown").upper()
+
+            summary_block = (
+                "\n\n---\n"
+                "### 📝 Summary\n"
+                f"{summary}\n\n"
+                "### 🔎 Suggested Follow-up Questions\n"
+                f"{sugg_text}\n\n"
+                f"> 🗄️ Data source: **{db_info}**"
+            )
+            base_answer_parts.append(summary_block)
+
+        timing = state.get("timing", {})
+        if timing:
+            timing_str = " | ".join(f"{k}: {v}s" for k, v in timing.items())
+            base_answer_parts.append(f"\n<sub>⏱ {timing_str}</sub>")
+
+        final_text = "\n".join(base_answer_parts)
+        state["final_result"] = final_text
+
+        if "history" not in state or state["history"] is None:
+            state["history"] = []
+
+        state["history"].append({
+            "question": state["question"],
+            "answer": final_text,
+            "database": state.get("vector_db_used", "unknown"),
+            "timestamp": datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Error formatting answer: {e}")
+        state["error"] = f"Answer formatting failed: {str(e)}"
+
+    state["timing"] = state.get("timing", {})
+    state["timing"]["format_answer"] = round(time.time() - start, 2)
+    return state
+
+# ================== Graph Setup & Public API ==================
+graph = StateGraph(AgentState)
+graph.add_node("agent_retrieve_and_df", agent_retrieve_and_df)
+graph.add_node("refine_query", agent_refine_query)
+graph.add_node("apply_query", agent_apply_query)
+graph.add_node("format_answer", agent_format_answer)
+
+graph.add_edge("agent_retrieve_and_df", "refine_query")
+graph.add_edge("refine_query", "apply_query")
+graph.add_edge("apply_query", "format_answer")
+
+graph.set_entry_point("agent_retrieve_and_df")
+graph.set_finish_point("format_answer")
+
+compiled_graph = graph.compile()
+
+def run_agent(question: str, history: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """
+    Public function used by FastAPI route.
+    """
+    state: AgentState = {
+        "question": question,
+        "history": history or [],
+        "timing": {},
+    }
+    result_state = compiled_graph.invoke(state)
+
+    df_result = result_state.get("df_result", pd.DataFrame())
+    if isinstance(df_result, pd.DataFrame):
+        df_records = df_result.to_dict(orient="records")
+    else:
+        df_records = []
+
+    return {
+        "final_result": result_state.get("final_result", ""),
+        "df_result": df_records,
+        "timing": result_state.get("timing", {}),
+        "vector_db_used": result_state.get("vector_db_used"),
+        "error": result_state.get("error"),
+    }
+
+
+backend/app/api/v1/routes_chat.py
+# backend/app/api/v1/routes_chat.py
+from typing import List, Optional, Dict, Any
+from fastapi import APIRouter
+from pydantic import BaseModel
+
+from app.services.agent import run_agent
+
+router = APIRouter()
+
+class ChatHistoryMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    question: str
+    history: Optional[List[ChatHistoryMessage]] = None
+
+class ChatResponse(BaseModel):
+    final_result: str
+    df_result: List[Dict[str, Any]]
+    timing: Dict[str, Any]
+    vector_db_used: Optional[str] = None
+    error: Optional[str] = None
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest) -> ChatResponse:
+    history_list = [msg.model_dump() for msg in (request.history or [])]
+    result = run_agent(question=request.question, history=history_list)
+
+    return ChatResponse(
+        final_result=result.get("final_result", ""),
+        df_result=result.get("df_result", []),
+        timing=result.get("timing", {}),
+        vector_db_used=result.get("vector_db_used"),
+        error=result.get("error"),
+    )
+
+
+backend/app/main.py
+# backend/app/main.py
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.core.logging_config import setup_logging
+from app.api.v1.routes_chat import router as chat_router
+
+logger = setup_logging()
+
+app = FastAPI(
+    title="SurveyIQ Agent Backend",
+    version="1.0.0",
+    description="FastAPI backend for SurveyIQ Agent using Vertex AI + BigQuery",
+)
+
+# CORS – allow Gradio frontend (adjust origins as needed)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(chat_router, prefix="/api/v1", tags=["chat"])
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+# For local: `uvicorn app.main:app --reload`
+
+
+backend/requirements.txt
+fastapi
+uvicorn[standard]
+pydantic>=1.10,<3
+pandas
+numpy
+google-cloud-bigquery
+google-cloud-aiplatform
+langgraph
+python-dotenv  # optional, not used now but handy
+
+
+backend/Dockerfile (optional for Cloud Run)
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+
+
+backend/service.yaml (example Cloud Run)
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: surveyiq-backend
+spec:
+  template:
+    spec:
+      containers:
+        - image: gcr.io/PROJECT_ID/surveyiq-backend:latest
+          env:
+            - name: PORT
+              value: "8080"
+          resources:
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+
+(Replace PROJECT_ID when you build.)
+
+3. Frontend (Gradio) Files
+frontend/app/main.py
+This is a simpler version of your Gradio UI that talks to the FastAPI backend via HTTP. You can later merge in your fancy CSS / history sidebar.
+# frontend/app/main.py
+import requests
+import gradio as gr
+
+API_URL = "http://localhost:8000/api/v1/chat"  # or Cloud Run URL
+
+def call_backend(message, history):
+    """
+    history is a list of (user, bot) tuples from Gradio.
+    We'll convert to role/content for backend.
+    """
+    conv_history = []
+    for user_msg, bot_msg in history:
+        if user_msg:
+            conv_history.append({"role": "user", "content": user_msg})
+        if bot_msg:
+            conv_history.append({"role": "assistant", "content": bot_msg})
+
+    payload = {
+        "question": message,
+        "history": conv_history,
+    }
+
+    try:
+        resp = requests.post(API_URL, json=payload, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        answer = data.get("final_result", "⚠️ No answer from backend.")
+        return answer
+    except Exception as e:
+        return f"⚠️ Error calling backend: {e}"
+
+with gr.Blocks(title="SurveyIQ Agent") as demo:
+    gr.Markdown(
+        """
+        # 🤖 SurveyIQ Agent
+        Talk to your Vertex AI + BigQuery powered CX assistant.
+        """
+    )
+
+    chatbot = gr.Chatbot(height=500)
+    msg = gr.Textbox(
+        placeholder="Ask about survey results, segments, satisfaction, etc.",
+        label="Your question",
+    )
+    clear = gr.Button("Clear")
+
+    def user(user_message, chat_history):
+        return "", chat_history + [[user_message, None]]
+
+    def bot(chat_history):
+        last_user_message = chat_history[-1][0]
+        answer = call_backend(last_user_message, chat_history[:-1])
+        chat_history[-1][1] = answer
+        return chat_history
+
+    msg.submit(user, [msg, chatbot], [msg, chatbot]).then(
+        bot, chatbot, chatbot
+    )
+    clear.click(lambda: None, None, chatbot, queue=False)
+
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", server_port=7860)
+
+
+frontend/requirements.txt
+gradio>=4.0.0
+requests
+
+
+4. Root Files
+.gitignore
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter / Vertex notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VSCode / PyCharm
+.vscode/
+.idea/
+
+# Build / dist
+dist/
+build/
+*.egg-info/
+
+# Google / Vertex
+.gcloudignore
+
+
+README.md
+# SurveyIQ Agent
+
+SurveyIQ Agent is a CX analytics assistant that combines:
+
+- **Vertex AI (Gemini)** for natural language understanding and summaries  
+- **BigQuery VECTOR_SEARCH** for semantic retrieval over survey embeddings  
+- **LangGraph** for a multi-step agent pipeline  
+- **FastAPI** backend  
+- **Gradio** frontend
+
+## Architecture
+
+- `backend/` – FastAPI service exposing `/api/v1/chat`
+  - Contains the Vertex AI + BigQuery + LangGraph agent logic.
+- `frontend/` – Gradio UI that calls the backend via HTTP.
+
+The backend is designed to run on **Vertex AI Workbench** or **Cloud Run** using
+Application Default Credentials (no `.env` required).
+
+## Backend – Local Development
+
+```bash
+cd backend
+pip install -r requirements.txt
+
+# Run FastAPI with uvicorn
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+Test health:
+curl http://localhost:8000/health
+
+Frontend – Local Development
+In another terminal:
+cd frontend
+pip install -r requirements.txt
+python app/main.py
+
+Then open the Gradio URL (default: http://127.0.0.1:7860) and start chatting.
+Make sure API_URL in frontend/app/main.py points to your backend
+(e.g., http://localhost:8000/api/v1/chat or your Cloud Run URL).
+Deploying Backend to Cloud Run (example)
+Build container:
+cd backend
+gcloud builds submit --tag gcr.io/PROJECT_ID/surveyiq-backend
+
+Deploy:
+gcloud run deploy surveyiq-backend \
+  --image gcr.io/PROJECT_ID/surveyiq-backend \
+  --platform managed \
+  --region us-central1 \
+  --allow-unauthenticated
+
+Update API_URL in the frontend to the Cloud Run URL.
+Configuration
+Configuration is in code (no .env):
+
+
+backend/app/core/config.py
+
+
+PROJECT_ID
+
+
+REGION
+
+
+BQ_DATASET
+
+
+BQ_TABLE
+
+
+retrieval limits
+
+
+
+
+Adjust those values to match your GCP setup.
+Notes
+
+
+Backend uses Application Default Credentials, so in Vertex AI Workbench
+or Cloud Run it will automatically use the attached service account.
+
+
+You can plug in your existing, more advanced Gradio UI (with sidebar, login, etc.)
+into frontend/app/main.py – just reuse the call_backend function.
+
+
+
+---
+
+If you’d like, I can next:
+
+- Merge your **fancy Gradio UI (SurveyIQ Agent with sidebar + login)** into this `frontend/app/main.py`, wired to the FastAPI backend.
+- Or add a small **test script** (`tests/test_chat.py`) to hit `/api/v1/chat` with a sample question.
